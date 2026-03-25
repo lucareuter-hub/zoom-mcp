@@ -6,8 +6,12 @@ import json
 import logging
 import os
 
+import uvicorn
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from zoom_mcp.auth.zoom_auth import ZoomAuth
 from zoom_mcp.resources.recordings import RecordingListParams, RecordingResource
@@ -25,16 +29,54 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Prüft bei jedem Request ob ein gültiger Bearer Token mitgeschickt wird."""
+
+    async def dispatch(self, request: Request, call_next):
+        secret = os.environ.get("MCP_SECRET_TOKEN")
+        if secret:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header != f"Bearer {secret}":
+                logger.warning(
+                    f"Unauthorized request from {request.client.host} "
+                    f"to {request.url.path}"
+                )
+                return Response("Unauthorized", status_code=401)
+        return await call_next(request)
+
+
+class SecureFastMCP(FastMCP):
+    """FastMCP mit eingebautem Bearer Token Schutz."""
+
+    async def run_sse_async(self, mount_path=None):
+        starlette_app = self.sse_app(mount_path)
+        starlette_app.add_middleware(BearerTokenMiddleware)
+        config = uvicorn.Config(
+            starlette_app,
+            host=self.settings.host,
+            port=self.settings.port,
+            log_level=self.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
+
 class ZoomMCP:
     def __init__(self):
         try:
             self.auth_manager = ZoomAuth.from_env()
             host = os.environ.get("FASTMCP_HOST", "0.0.0.0")
             port = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8000")))
-            self.mcp_server = FastMCP("Zoom", host=host, port=port)
+            self.mcp_server = SecureFastMCP("Zoom", host=host, port=port)
             self.name = "Zoom"
             self._register_resources()
             self._register_tools()
+
+            if os.environ.get("MCP_SECRET_TOKEN"):
+                logger.info("Bearer token authentication is ENABLED.")
+            else:
+                logger.warning("MCP_SECRET_TOKEN is not set — server is UNPROTECTED.")
+
         except Exception as e:
             logger.error(f"Error initializing Zoom MCP server: {str(e)}")
             raise
@@ -66,7 +108,7 @@ class ZoomMCP:
                 raise
 
     def start(self, transport: str = "sse"):
-        """Start the MCP server. Defaults to SSE for remote/hosted deployments."""
+        """Start the MCP server. Defaults to SSE for remote deployments."""
         self.mcp_server.run(transport=transport)
 
     def stop(self):
